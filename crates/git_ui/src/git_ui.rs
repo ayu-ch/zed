@@ -707,6 +707,11 @@ impl RenderOnce for GitStatusIcon {
                 IconName::Warning,
                 cx.theme().colors().version_control_conflict,
             )
+        } else if status.is_renamed() {
+            (
+                IconName::Replace,
+                cx.theme().colors().version_control_modified,
+            )
         } else if status.is_deleted() {
             (
                 IconName::SquareMinus,

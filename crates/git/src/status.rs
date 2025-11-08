@@ -203,6 +203,16 @@ impl FileStatus {
         matches!(self, FileStatus::Untracked)
     }
 
+    pub fn is_renamed(self) -> bool {
+        match self {
+            FileStatus::Tracked(tracked) => matches!(
+                (tracked.index_status, tracked.worktree_status),
+                (StatusCode::Renamed, _) | (_, StatusCode::Renamed)
+            ),
+            _ => false,
+        }
+    }
+
     pub fn summary(self) -> GitSummary {
         match self {
             FileStatus::Ignored => GitSummary::UNCHANGED,
@@ -238,7 +248,7 @@ impl StatusCode {
 
     fn to_summary(self) -> TrackedSummary {
         match self {
-            StatusCode::Modified | StatusCode::TypeChanged => TrackedSummary {
+            StatusCode::Modified | StatusCode::TypeChanged | StatusCode::Renamed => TrackedSummary {
                 modified: 1,
                 ..TrackedSummary::UNCHANGED
             },
@@ -250,7 +260,7 @@ impl StatusCode {
                 deleted: 1,
                 ..TrackedSummary::UNCHANGED
             },
-            StatusCode::Renamed | StatusCode::Copied | StatusCode::Unmodified => {
+            StatusCode::Copied | StatusCode::Unmodified => {
                 TrackedSummary::UNCHANGED
             }
         }
@@ -436,28 +446,75 @@ impl FromStr for GitStatus {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let mut entries = s
-            .split('\0')
-            .filter_map(|entry| {
-                let sep = entry.get(2..3)?;
-                if sep != " " {
-                    return None;
+        let mut parts = s.split('\0').peekable();
+        let mut entries = Vec::new();
+        
+        while let Some(entry) = parts.next() {
+            if entry.is_empty() {
+                continue;
+            }
+            
+            let sep = match entry.get(2..3) {
+                Some(s) => s,
+                None => continue,
+            };
+            
+            if sep != " " {
+                continue;
+            }
+            
+            let status_bytes = entry.as_bytes()[0..2].try_into().unwrap();
+            let status = match FileStatus::from_bytes(status_bytes).log_err() {
+                Some(s) => s,
+                None => continue,
+            };
+            
+            // Check if this is a rename or copy (which have two paths)
+            let is_rename_or_copy = matches!(status_bytes, [b'R', _] | [_, b'R'] | [b'C', _] | [_, b'C']);
+            
+            if is_rename_or_copy {
+                // For renames/copies, format is: "R100 old_path\0new_path\0"
+                // We already consumed the first part, now get the old and new paths
+                let _old_path = parts.next(); // Skip old path for now
+                let new_path = match parts.next() {
+                    Some(p) => p,
+                    None => continue,
                 };
+                
+                // The git status output includes untracked directories as well as untracked files.
+                // We do our own processing to compute the "summary" status of each directory,
+                // so just skip any directories in the output, since they'll otherwise interfere
+                // with our handling of nested repositories.
+                if new_path.ends_with('/') {
+                    continue;
+                }
+                
+                // git-status outputs `/`-delimited repo paths, even on Windows.
+                let path = match RelPath::unix(new_path).log_err() {
+                    Some(p) => RepoPath(p.into()),
+                    None => continue,
+                };
+                entries.push((path, status));
+            } else {
+                // Normal status entry
                 let path = &entry[3..];
+                
                 // The git status output includes untracked directories as well as untracked files.
                 // We do our own processing to compute the "summary" status of each directory,
                 // so just skip any directories in the output, since they'll otherwise interfere
                 // with our handling of nested repositories.
                 if path.ends_with('/') {
-                    return None;
+                    continue;
                 }
-                let status = entry.as_bytes()[0..2].try_into().unwrap();
-                let status = FileStatus::from_bytes(status).log_err()?;
+                
                 // git-status outputs `/`-delimited repo paths, even on Windows.
-                let path = RepoPath(RelPath::unix(path).log_err()?.into());
-                Some((path, status))
-            })
-            .collect::<Vec<_>>();
+                let path = match RelPath::unix(path).log_err() {
+                    Some(p) => RepoPath(p.into()),
+                    None => continue,
+                };
+                entries.push((path, status));
+            }
+        }
         entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         // When a file exists in HEAD, is deleted in the index, and exists again in the working copy,
         // git produces two lines for it, one reading `D ` (deleted in index, unmodified in working copy)
@@ -580,8 +637,37 @@ mod tests {
 
     use crate::{
         repository::RepoPath,
-        status::{TreeDiff, TreeDiffStatus},
+        status::{FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus},
     };
+
+    #[test]
+    fn test_git_status_with_renames() {
+        // Test parsing git status output with renamed files
+        // Format: "R100 old_name\0new_name\0"
+        let input = "R  old_file.txt\0new_file.txt\0M  modified.txt\0?? untracked.txt\0";
+        
+        let status: GitStatus = input.parse().unwrap();
+        
+        assert_eq!(status.entries.len(), 3);
+        
+        // Check that the renamed file shows up with the new name
+        let renamed_entry = status.entries.iter().find(|(path, _)| path.0.as_str() == "new_file.txt");
+        assert!(renamed_entry.is_some());
+        let (_, file_status) = renamed_entry.unwrap();
+        assert!(file_status.is_renamed());
+        
+        // Check modified file
+        let modified_entry = status.entries.iter().find(|(path, _)| path.0.as_str() == "modified.txt");
+        assert!(modified_entry.is_some());
+        let (_, file_status) = modified_entry.unwrap();
+        assert!(file_status.is_modified());
+        
+        // Check untracked file
+        let untracked_entry = status.entries.iter().find(|(path, _)| path.0.as_str() == "untracked.txt");
+        assert!(untracked_entry.is_some());
+        let (_, file_status) = untracked_entry.unwrap();
+        assert!(file_status.is_untracked());
+    }
 
     #[test]
     fn test_tree_diff_parsing() {

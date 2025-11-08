@@ -3994,10 +3994,13 @@ impl GitPanel {
         let has_conflict = status.is_conflicted();
         let is_modified = status.is_modified();
         let is_deleted = status.is_deleted();
+        let is_renamed = status.is_renamed();
 
         let label_color = if status_style == StatusStyle::LabelColor {
             if has_conflict {
                 Color::VersionControlConflict
+            } else if is_renamed {
+                Color::VersionControlModified
             } else if is_modified {
                 Color::VersionControlModified
             } else if is_deleted {

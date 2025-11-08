@@ -2032,7 +2032,7 @@ fn git_status_args(path_prefixes: &[RepoPath]) -> Vec<OsString> {
         OsString::from("status"),
         OsString::from("--porcelain=v1"),
         OsString::from("--untracked-files=all"),
-        OsString::from("--no-renames"),
+        OsString::from("--renames"),
         OsString::from("-z"),
     ];
     args.extend(path_prefixes.iter().map(|path_prefix| {
